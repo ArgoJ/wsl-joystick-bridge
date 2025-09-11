@@ -34,8 +34,8 @@ AXIS_MAP = {
 }
 
 BUTTON_MAP = {
-    ecodes.BTN_SOUTH: 0,
-    ecodes.BTN_EAST: 1,
+    ecodes.BTN_EAST: 0,
+    ecodes.BTN_SOUTH: 1,
     ecodes.BTN_WEST: 2,
     ecodes.BTN_NORTH: 3,
     ecodes.BTN_TL: 4,
@@ -53,36 +53,29 @@ class EvdevJoyNode(Node):
     def __init__(self):
         super().__init__('evdev_joy_node')
 
-        # Parameter deklarieren
         self.declare_parameter('joy_topic', DEFAULT_TOPIC)
         self.declare_parameter('device_path', DEFAULT_DEVICE_PATH)
         self.declare_parameter('deadzone', DEFAULT_DEADZONE)
         self.declare_parameter('frame_id', DEFAULT_FRAME_ID)
         self.declare_parameter('reconnect_seconds', DEFAULT_RECONNECT_SECONDS)
 
-        # Parameter lesen
         self.joy_topic = self.get_parameter('joy_topic').get_parameter_value().string_value
         self.device_path = self.get_parameter('device_path').get_parameter_value().string_value
         self.deadzone = float(self.get_parameter('deadzone').value)
         self.frame_id = self.get_parameter('frame_id').get_parameter_value().string_value
         self.reconnect_seconds = float(self.get_parameter('reconnect_seconds').value)
 
-        # Publisher (Topic aus Parameter)
         self.publisher_ = self.create_publisher(Joy, self.joy_topic, 10)
         self.get_logger().info(f"Joystick Publisher auf Topic '{self.joy_topic}' gestartet (Device: {self.device_path})")
 
-        # Parameter-Callback für dynamische Änderungen (z.B. Deadzone)
         self.add_on_set_parameters_callback(self.on_parameters_set)
 
-        # Initialisiere den Zustand der Joy-Nachricht
         self.joy_msg = Joy()
         self.joy_msg.axes = [0.0] * 8
         self.joy_msg.buttons = [0] * 13
 
-        # Shutdown-Steuerung
         self._stop_event = threading.Event()
 
-        # Starte den Controller-Lese-Thread
         self.thread = threading.Thread(target=self.controller_read_loop, name='evdev_reader')
         self.thread.daemon = True
         self.thread.start()
@@ -103,7 +96,6 @@ class EvdevJoyNode(Node):
                 self.frame_id = str(p.value)
                 updates.append(f"frame_id='{self.frame_id}'")
             elif p.name == 'joy_topic':
-                # Technisch möglich wäre das dynamische Umschalten mit neuem Publisher; hier vereinfachen wir.
                 self.get_logger().warn('Änderung von joy_topic zur Laufzeit nicht unterstützt. Bitte Node neu starten.')
             elif p.name == 'device_path':
                 self.get_logger().warn('Änderung von device_path zur Laufzeit nicht unterstützt. Bitte Node neu starten.')
@@ -137,19 +129,17 @@ class EvdevJoyNode(Node):
                     self.publisher_.publish(self.joy_msg)
             except (FileNotFoundError, PermissionError, OSError) as e:
                 now = time.time()
-                # Log nur gelegentlich, um Spam zu vermeiden
                 if now - last_error_logged > 2.0:
                     self.get_logger().warn(f"Kann Device '{self.device_path}' nicht öffnen: {e}. Erneuter Versuch in {self.reconnect_seconds}s")
                     last_error_logged = now
                 if self._stop_event.wait(self.reconnect_seconds):
                     break
-            except Exception as e:  # Unerwarteter Fehler
+            except Exception as e:
                 self.get_logger().error(f"Unerwarteter Fehler im Lesethread: {e}")
                 if self._stop_event.wait(self.reconnect_seconds):
                     break
 
     def destroy_node(self):
-        # Ordnungsgemäßes Beenden des Threads
         self._stop_event.set()
         try:
             if self.thread.is_alive():
@@ -160,27 +150,37 @@ class EvdevJoyNode(Node):
 
     def process_event(self, event):
         """Verarbeitet ein einzelnes evdev-Event und aktualisiert self.joy_msg."""
-        # --- BUTTONS (unverändert) ---
+        # --- BUTTONS ---
+
         if event.type == ecodes.EV_KEY and event.code in BUTTON_MAP:
             button_index = BUTTON_MAP[event.code]
             self.joy_msg.buttons[button_index] = int(event.value > 0)
+            if event.value > 0:
+                self.get_logger().debug(f"Event: type={event.type}, code={event.code}, value={event.value}")
 
-        # --- ACHSEN (komplett überarbeitet) ---
+        # --- ACHSEN ---
         elif event.type == ecodes.EV_ABS and event.code in AXIS_MAP:
             axis_index = AXIS_MAP[event.code]
             value = event.value
 
-            norm_val = value / 255.0
-            if event.code not in [ecodes.ABS_RX, ecodes.ABS_RY]:
+            if event.code in [ecodes.ABS_HAT0X, ecodes.ABS_HAT0Y]:
+                norm_val = value
+            else:
+                norm_val = value / 255.0
+
+            if event.code not in [ecodes.ABS_RX, ecodes.ABS_RY, ecodes.ABS_HAT0X, ecodes.ABS_HAT0Y]:
                 norm_val = norm_val * 2.0 - 1.0
 
-            if event.code in [ecodes.ABS_Y, ecodes.ABS_RZ]:
+            if event.code in [ecodes.ABS_Y, ecodes.ABS_RZ, ecodes.ABS_HAT0Y]:
                 norm_val *= -1.0
 
             if abs(norm_val) < self.deadzone:
                 norm_val = 0.0
 
             self.joy_msg.axes[axis_index] = norm_val
+
+            if norm_val > 0:
+                self.get_logger().debug(f"Event: type={event.type}, code={event.code}, value={event.value}")
 
 def main(args=None):
     rclpy.init(args=args)
