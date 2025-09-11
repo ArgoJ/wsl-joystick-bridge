@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from sensor_msgs.msg import Joy
 from evdev import InputDevice, ecodes
 import threading
+import time
 
-# --- Konfiguration ---
-DEVICE_PATH = '/dev/input/event0'
-DEADZONE_TOL = 0.1
+# --- Standard-Konfiguration (Default Parameterwerte) ---
+DEFAULT_DEVICE_PATH = '/dev/input/event0'
+DEFAULT_DEADZONE = 0.1
+DEFAULT_TOPIC = 'joy'
+DEFAULT_FRAME_ID = ''
+DEFAULT_RECONNECT_SECONDS = 3.0
 
 # --- Mappings ---
 AXIS_MAP = {
@@ -47,36 +52,111 @@ BUTTON_MAP = {
 class EvdevJoyNode(Node):
     def __init__(self):
         super().__init__('evdev_joy_node')
-        
-        # ROS Publisher initialisieren
-        self.publisher_ = self.create_publisher(Joy, 'joy', 10)
-        
+
+        # Parameter deklarieren
+        self.declare_parameter('joy_topic', DEFAULT_TOPIC)
+        self.declare_parameter('device_path', DEFAULT_DEVICE_PATH)
+        self.declare_parameter('deadzone', DEFAULT_DEADZONE)
+        self.declare_parameter('frame_id', DEFAULT_FRAME_ID)
+        self.declare_parameter('reconnect_seconds', DEFAULT_RECONNECT_SECONDS)
+
+        # Parameter lesen
+        self.joy_topic = self.get_parameter('joy_topic').get_parameter_value().string_value
+        self.device_path = self.get_parameter('device_path').get_parameter_value().string_value
+        self.deadzone = float(self.get_parameter('deadzone').value)
+        self.frame_id = self.get_parameter('frame_id').get_parameter_value().string_value
+        self.reconnect_seconds = float(self.get_parameter('reconnect_seconds').value)
+
+        # Publisher (Topic aus Parameter)
+        self.publisher_ = self.create_publisher(Joy, self.joy_topic, 10)
+        self.get_logger().info(f"Joystick Publisher auf Topic '{self.joy_topic}' gestartet (Device: {self.device_path})")
+
+        # Parameter-Callback für dynamische Änderungen (z.B. Deadzone)
+        self.add_on_set_parameters_callback(self.on_parameters_set)
+
         # Initialisiere den Zustand der Joy-Nachricht
         self.joy_msg = Joy()
         self.joy_msg.axes = [0.0] * 8
         self.joy_msg.buttons = [0] * 13
 
+        # Shutdown-Steuerung
+        self._stop_event = threading.Event()
+
         # Starte den Controller-Lese-Thread
-        self.thread = threading.Thread(target=self.controller_read_loop)
+        self.thread = threading.Thread(target=self.controller_read_loop, name='evdev_reader')
         self.thread.daemon = True
         self.thread.start()
 
+    # ---------------- Parameter Update Callback ----------------
+    def on_parameters_set(self, params):
+        updates = []
+        for p in params:
+            if p.name == 'deadzone':
+                val = float(p.value)
+                if not (0.0 <= val < 1.0):
+                    from rclpy.parameter import SetParametersResult
+                    self.get_logger().error('Deadzone muss zwischen 0.0 (inkl.) und 1.0 (exkl.) liegen.')
+                    return SetParametersResult(successful=False)
+                self.deadzone = val
+                updates.append(f"deadzone={val:.3f}")
+            elif p.name == 'frame_id':
+                self.frame_id = str(p.value)
+                updates.append(f"frame_id='{self.frame_id}'")
+            elif p.name == 'joy_topic':
+                # Technisch möglich wäre das dynamische Umschalten mit neuem Publisher; hier vereinfachen wir.
+                self.get_logger().warn('Änderung von joy_topic zur Laufzeit nicht unterstützt. Bitte Node neu starten.')
+            elif p.name == 'device_path':
+                self.get_logger().warn('Änderung von device_path zur Laufzeit nicht unterstützt. Bitte Node neu starten.')
+            elif p.name == 'reconnect_seconds':
+                try:
+                    self.reconnect_seconds = max(0.5, float(p.value))
+                    updates.append(f"reconnect_seconds={self.reconnect_seconds}")
+                except ValueError:
+                    from rclpy.parameter import SetParametersResult
+                    self.get_logger().error('reconnect_seconds muss eine Zahl sein.')
+                    return SetParametersResult(successful=False)
+
+        if updates:
+            self.get_logger().info('Parameter aktualisiert: ' + ', '.join(updates))
+        from rclpy.parameter import SetParametersResult
+        return SetParametersResult(successful=True)
+
     def controller_read_loop(self):
-        """Diese Funktion läuft in einem separaten Thread und wartet auf Controller-Events."""
+        """Liest kontinuierlich Events; versucht bei Fehlern erneut zu verbinden."""
+        last_error_logged = 0.0
+        while not self._stop_event.is_set():
+            try:
+                device = InputDevice(self.device_path)
+                self.get_logger().info(f"Controller '{device.name}' verbunden (Pfad: {self.device_path}).")
+                for event in device.read_loop():
+                    if self._stop_event.is_set():
+                        break
+                    self.process_event(event)
+                    self.joy_msg.header.stamp = self.get_clock().now().to_msg()
+                    self.joy_msg.header.frame_id = self.frame_id
+                    self.publisher_.publish(self.joy_msg)
+            except (FileNotFoundError, PermissionError, OSError) as e:
+                now = time.time()
+                # Log nur gelegentlich, um Spam zu vermeiden
+                if now - last_error_logged > 2.0:
+                    self.get_logger().warn(f"Kann Device '{self.device_path}' nicht öffnen: {e}. Erneuter Versuch in {self.reconnect_seconds}s")
+                    last_error_logged = now
+                if self._stop_event.wait(self.reconnect_seconds):
+                    break
+            except Exception as e:  # Unerwarteter Fehler
+                self.get_logger().error(f"Unerwarteter Fehler im Lesethread: {e}")
+                if self._stop_event.wait(self.reconnect_seconds):
+                    break
+
+    def destroy_node(self):
+        # Ordnungsgemäßes Beenden des Threads
+        self._stop_event.set()
         try:
-            device = InputDevice(DEVICE_PATH)
-            self.get_logger().info(f"Controller '{device.name}' erfolgreich verbunden.")
-        except (FileNotFoundError, PermissionError) as e:
-            self.get_logger().error(f"Fehler beim Verbinden mit dem Controller: {e}")
-            return
-
-        for event in device.read_loop():
-            # Aktualisiere die Joy-Nachricht basierend auf dem Event
-            self.process_event(event)
-
-            # Veröffentliche die aktualisierte Nachricht
-            self.joy_msg.header.stamp = self.get_clock().now().to_msg()
-            self.publisher_.publish(self.joy_msg)
+            if self.thread.is_alive():
+                self.thread.join(timeout=1.0)
+        except Exception:
+            pass
+        super().destroy_node()
 
     def process_event(self, event):
         """Verarbeitet ein einzelnes evdev-Event und aktualisiert self.joy_msg."""
@@ -97,7 +177,7 @@ class EvdevJoyNode(Node):
             if event.code in [ecodes.ABS_Y, ecodes.ABS_RZ]:
                 norm_val *= -1.0
 
-            if abs(norm_val) < DEADZONE_TOL:
+            if abs(norm_val) < self.deadzone:
                 norm_val = 0.0
 
             self.joy_msg.axes[axis_index] = norm_val
