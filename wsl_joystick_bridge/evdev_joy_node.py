@@ -20,12 +20,14 @@ AXIS_MAP = {
     ecodes.ABS_X: 0,
     ecodes.ABS_Y: 1,
 
+    # Left Trigger
+    ecodes.ABS_RX: 4,
+
     # Rechter Stick
     ecodes.ABS_Z: 2,
     ecodes.ABS_RZ: 3,
 
-    # Trigger
-    ecodes.ABS_RX: 4,
+    # Right Trigger
     ecodes.ABS_RY: 5,
 
     # D-Pad
