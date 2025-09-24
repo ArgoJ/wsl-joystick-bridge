@@ -173,7 +173,7 @@ class EvdevJoyNode(Node):
             if event.code not in [ecodes.ABS_RX, ecodes.ABS_RY, ecodes.ABS_HAT0X, ecodes.ABS_HAT0Y]:
                 norm_val = norm_val * 2.0 - 1.0
 
-            if event.code in [ecodes.ABS_Y, ecodes.ABS_RZ, ecodes.ABS_HAT0Y]:
+            if event.code in [ecodes.ABS_Y, ecodes.ABS_HAT0Y]:
                 norm_val *= -1.0
 
             if abs(norm_val) < self.deadzone:
